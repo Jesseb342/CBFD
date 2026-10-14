@@ -1,0 +1,99 @@
+# .github/workflows/build-bananapad.yml
+#
+# Milestone 1: reproduce BananaPad's one-command device build on a GitHub
+# macOS runner, starting from an ENCRYPTED ROM stored in a PRIVATE repo.
+#
+# One-time setup:
+#   -> upload dk64.z64 to Google Drive
+#   -> share it as "Anyone with the link" (the runner has no Google login)
+#   -> copy the file ID from the link:
+#        https://drive.google.com/file/d/<FILE_ID>/view
+#   -> the ID is hardcoded below (fine for a private repo); to hide it,
+#      move it to a repo secret and use ${{ secrets.ROM_DRIVE_ID }}
+#   -> if the link is ever exposed, delete the file or turn sharing off
+#
+# IMPORTANT: keep the repo PRIVATE and artifact retention short. The IPA
+# contains code translated from the game, and the ROM must never land in a
+# tracked path or a public artifact.
+#
+# UNTESTED: written from BananaPad's README. Expect to tweak runner image,
+# Xcode selection, and Homebrew packages on the first few runs.
+
+name: Build BananaPad (unsigned IPA)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15          # Apple Silicon image; confirm in GitHub's runner-images list
+    timeout-minutes: 150       # README says the first build takes ~35 min
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select newest stable Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | grep -vi beta | sort -V | tail -1)
+          echo "Using $XC"
+          sudo xcode-select -s "$XC/Contents/Developer"
+          xcodebuild -version
+
+      - name: Download Metal Toolchain (Xcode 26+ ships it separately)
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Install build tools
+        run: |
+          brew update
+          brew install cmake ninja jq python@3.11 rust gcc
+          # README requires GNU cpp-16; check what Homebrew actually provides
+          ls "$(brew --prefix)/bin" | grep -E '^cpp-' || true
+
+      # ROM comes from Google Drive into runner temp, never the workspace
+      # (BananaPad's check-repo-safety.sh rejects ROMs in tracked paths).
+      # The Drive file ID is hardcoded; the repo must stay private.
+      - name: Download ROM from Google Drive
+        env:
+          ROM_DRIVE_ID: 1o0VleUNoR2HZPM0JztcRsvnhYLru2dyc
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet gdown
+          "$RUNNER_TEMP/venv/bin/gdown" --id "$ROM_DRIVE_ID" \
+              -O "$RUNNER_TEMP/dk64.z64"
+          ls -l "$RUNNER_TEMP/dk64.z64"
+          # Sanity check: a failed download is usually a small HTML page
+          test "$(stat -f%z "$RUNNER_TEMP/dk64.z64")" -gt 10000000
+          # BananaPad expects a ROM that normalizes to SHA-1
+          # cf806ff2603640a748fca5026ded28802f1f4a50 (its script verifies this)
+
+      - name: Check prerequisites
+        run: scripts/check-prerequisites.sh
+
+      - name: Build unsigned device IPA
+        run: |
+          scripts/bootstrap-bananapad.sh \
+            --rom "$RUNNER_TEMP/dk64.z64" \
+            --target device
+
+      - name: Upload IPA (private artifact, short retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bananapad-unsigned-ipa
+          path: generated/packages/*.ipa
+          retention-days: 2
+          if-no-files-found: error
+
+      - name: Upload validation receipt (no ROM data)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-receipt
+          path: generated/validation/bootstrap-last-run.json
+          retention-days: 2
+          if-no-files-found: ignore
+
+      - name: Remove decrypted ROM
+        if: always()
+        run: rm -f "$RUNNER_TEMP/dk64.z64"
+
